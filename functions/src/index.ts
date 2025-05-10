@@ -1,71 +1,98 @@
-import * as functions from 'firebase-functions'
-import * as admin from 'firebase-admin'
-import * as crypto from 'crypto'
-import axios from 'axios'
+import * as functions from "firebase-functions/v1";
+import * as admin from "firebase-admin";
+import express from "express";
+import * as crypto from "crypto";
+import axios from "axios";
 
-admin.initializeApp()
-const db = admin.firestore()
+// 初始化 Firebase Admin
+admin.initializeApp();
+const db = admin.firestore();
 
-export const lineWebhook = functions.https.onRequest(async (req, res) => {
-  const tenantId = req.path.split('/').pop() // e.g. /line-webhook/tenant_demo
+const app = express();
 
-  if (!tenantId) {
-    res.status(400).send('Missing tenantId')
-    return
-  }
+// Webhook 專用 raw middleware
+app.post(
+  "/webhook/:tenantId",
+  express.raw({ type: "*/*" }),
+  async (req, res) => {
+    const tenantId = req.params.tenantId;
+    const contentType = req.get("content-type") || "undefined";
+    const signature = req.get("x-line-signature") || "";
 
-  const signature = req.headers['x-line-signature'] as string
-  const rawBody = req.rawBody
-  const body = JSON.parse(rawBody.toString('utf8'))
+    console.log("📩 Received webhook");
+    console.log("👉 tenantId:", tenantId);
+    console.log("👉 Content-Type:", contentType);
+    console.log("👉 Signature:", signature);
+    console.log("👉 RawBody length:", req.body?.length);
 
-  // 取得租戶資料
-  const tenantDoc = await db.collection('tenants').doc(tenantId).get()
-  if (!tenantDoc.exists) {
-    res.status(404).send('Tenant not found')
-    return
-  }
+    if (!tenantId) return res.status(400).send("Missing tenantId");
 
-  const tenantData = tenantDoc.data()
-  const channelSecret = tenantData?.lineChannelSecret
-  const accessToken = tenantData?.lineChannelAccessToken
+    const rawBody = req.body as Buffer;
 
-  // 驗證簽名
-  const hash = crypto
-    .createHmac('SHA256', channelSecret)
-    .update(rawBody)
-    .digest('base64')
-
-  if (hash !== signature) {
-    res.status(403).send('Invalid signature')
-    return
-  }
-
-  const events = body.events
-  for (const event of events) {
-    if (event.type === 'message' && event.message.type === 'text') {
-      const replyToken = event.replyToken
-      const userMessage = event.message.text
-
-      await axios.post(
-        'https://api.line.me/v2/bot/message/reply',
-        {
-          replyToken,
-          messages: [
-            {
-              type: 'text',
-              text: `【${tenantData?.name}】回覆你：${userMessage}`,
-            },
-          ],
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-        }
-      )
+    let body: any;
+    try {
+      body = JSON.parse(rawBody.toString("utf8"));
+      console.log("✅ Parsed body:", body);
+    } catch (err) {
+      console.error("❌ Invalid JSON:", err);
+      return res.status(400).send("Invalid JSON");
     }
-  }
 
-  res.status(200).send('OK')
-})
+    const docSnap = await db.collection("tenants").doc(tenantId).get();
+    if (!docSnap.exists) {
+      console.error("❌ Tenant not found:", tenantId);
+      return res.status(404).send("Tenant not found");
+    }
+
+    const cfg = docSnap.data()!;
+    const secret = cfg.lineChannelSecret as string;
+    const token = cfg.lineChannelAccessToken as string;
+
+    const hash = crypto
+      .createHmac("SHA256", secret)
+      .update(rawBody)
+      .digest("base64");
+
+    if (hash !== signature) {
+      console.error("❌ Signature mismatch");
+      console.error("Expected:", hash);
+      console.error("Received:", signature);
+      return res.status(403).send("Invalid signature");
+    }
+
+    for (const evt of body.events || []) {
+      console.log("📦 Event:", evt);
+      if (evt.type === "message" && evt.message.type === "text") {
+        try {
+          const reply = await axios.post(
+            "https://api.line.me/v2/bot/message/reply",
+            {
+              replyToken: evt.replyToken,
+              messages: [
+                {
+                  type: "text",
+                  text: `【${cfg.name}】收到：${evt.message.text}`,
+                },
+              ],
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                "Content-Type": "application/json",
+              },
+            }
+          );
+          console.log("✅ LINE reply success:", reply.data);
+        } catch (err) {
+          console.error("❌ LINE reply failed:", err);
+        }
+      }
+    }
+
+    return res.status(200).send("OK");
+  }
+);
+
+
+// 匯出 Function
+export const api = functions.region("asia-east1").https.onRequest(app);
